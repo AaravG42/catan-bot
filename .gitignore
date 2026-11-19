@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+*.egg-info/
+.DS_Store
+# build output
+engine/libcatan.so
+engine/libcatan.dylib
+engine/bench
+# generated locally: self-play data, run logs, packed submissions
+/data/
+/logs/
+/submissions/

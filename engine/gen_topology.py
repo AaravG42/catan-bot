@@ -1,0 +1,149 @@
+"""Generate engine/topology.h from the installed (patched) catanatron.
+
+Everything the C engine needs that is fixed by catanatron's map code: node, edge, tile and port ids,
+adjacency in catanatron's own iteration order, the official-spiral tile order, and the 332-entry
+action enumeration of catanatron.gym's ACTIONS_ARRAY (player colours RED, BLUE; map BASE).
+
+Run:  PYTHONHASHSEED=0 .venv/bin/python engine/gen_topology.py
+"""
+import importlib.util
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import catan_kit  # noqa: F401,E402  (deterministic patches)
+import catanatron  # noqa: E402
+from catanatron.models.board import STATIC_GRAPH, get_edges  # noqa: E402
+from catanatron.models.enums import RESOURCES, ActionType, NodeRef  # noqa: E402
+from catanatron.models.map import BASE_MAP_TEMPLATE, CatanMap, PORT_DIRECTION_TO_NODEREFS  # noqa: E402
+from catanatron.models.map import BASE_NUMBERS_IN_SPIRAL_ORDER  # noqa: E402
+from catanatron.models.player import Color  # noqa: E402
+from catanatron.models.spiral import spiral_land_coordinates  # noqa: E402
+
+
+def load_action_space():
+    """catanatron.gym's __init__ needs gymnasium; load the action_space module on its own."""
+    p = os.path.join(os.path.dirname(catanatron.__file__), "gym", "envs", "action_space.py")
+    spec = importlib.util.spec_from_file_location("catan_action_space", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+COLORS = (Color.RED, Color.BLUE)
+NODEREFS = [NodeRef.NORTH, NodeRef.NORTHEAST, NodeRef.SOUTHEAST, NodeRef.SOUTH,
+            NodeRef.SOUTHWEST, NodeRef.NORTHWEST]
+# action type codes used by the C engine
+AT = {ActionType.BUILD_CITY: 0, ActionType.BUILD_ROAD: 1, ActionType.BUILD_SETTLEMENT: 2,
+      ActionType.BUY_DEVELOPMENT_CARD: 3, ActionType.DISCARD_RESOURCE: 4, ActionType.END_TURN: 5,
+      ActionType.MARITIME_TRADE: 6, ActionType.MOVE_ROBBER: 7, ActionType.PLAY_KNIGHT_CARD: 8,
+      ActionType.PLAY_MONOPOLY: 9, ActionType.PLAY_ROAD_BUILDING: 10,
+      ActionType.PLAY_YEAR_OF_PLENTY: 11, ActionType.ROLL: 12}
+
+
+def main():
+    m = CatanMap.from_template(BASE_MAP_TEMPLATE)
+    land = list(m.land_tiles.items())               # (coordinate, tile), tile.id == index
+    assert [t.id for _, t in land] == list(range(19))
+    assert sorted(m.land_nodes) == list(range(54))
+    edges = [tuple(sorted(e)) for e in get_edges(None)]
+    assert len(edges) == 72
+    edge_id = {e: i for i, e in enumerate(edges)}
+    coord_id = {c: t.id for c, t in land}
+
+    nbr, nbr_edge = [], []
+    for n in range(54):
+        ns = [v for v in STATIC_GRAPH.neighbors(n) if v < 54]  # land neighbours, graph order
+        nbr.append(ns + [-1] * (3 - len(ns)))
+        nbr_edge.append([edge_id[tuple(sorted((n, v)))] for v in ns] + [-1] * (3 - len(ns)))
+    tile_nodes = [[t.nodes[r] for r in NODEREFS] for _, t in land]
+    node_tiles = []
+    for n in range(54):
+        ts = [t.id for t in m.adjacent_tiles[n]]
+        node_tiles.append(ts + [-1] * (3 - len(ts)))
+    ports = sorted(m.ports_by_id.values(), key=lambda p: p.id)
+    port_nodes = []
+    for p in ports:
+        a, b = PORT_DIRECTION_TO_NODEREFS[p.direction]
+        port_nodes.append([p.nodes[a], p.nodes[b]])
+    spiral = [coord_id[c] for c in spiral_land_coordinates(m.tiles, (2, -2, 0))]
+    assert sorted(spiral) == list(range(19))
+
+    aspace = load_action_space()
+    arr = aspace.get_action_array(COLORS, "BASE")
+    assert len(arr) == 332
+    rows = []  # (type, a, b, c)
+    for at, v in arr:
+        t = AT[at]
+        if at in (ActionType.BUILD_CITY, ActionType.BUILD_SETTLEMENT):
+            rows.append((t, v, 0, 0))
+        elif at == ActionType.BUILD_ROAD:
+            rows.append((t, edge_id[v], 0, 0))
+        elif at in (ActionType.DISCARD_RESOURCE, ActionType.PLAY_MONOPOLY):
+            rows.append((t, RESOURCES.index(v), 0, 0))
+        elif at == ActionType.MARITIME_TRADE:
+            give = RESOURCES.index(v[0])
+            rate = sum(1 for x in v[:4] if x is not None)
+            rows.append((t, give, rate, RESOURCES.index(v[4])))
+        elif at == ActionType.MOVE_ROBBER:
+            coord, victim = v
+            rows.append((t, coord_id[coord], 0 if victim is None else 1 + COLORS.index(victim), 0))
+        elif at == ActionType.PLAY_YEAR_OF_PLENTY:
+            if len(v) == 2:
+                rows.append((t, RESOURCES.index(v[0]), RESOURCES.index(v[1]), 2))
+            else:
+                rows.append((t, RESOURCES.index(v[0]), 0, 1))
+        else:
+            rows.append((t, 0, 0, 0))
+
+    def arr2(name, a, ctype="int8_t"):
+        dims = f"[{len(a)}][{len(a[0])}]"
+        body = ",\n".join("  {" + ",".join(str(x) for x in r) + "}" for r in a)
+        return f"static const {ctype} {name}{dims} = {{\n{body}\n}};\n"
+
+    def arr1(name, a, ctype="int8_t"):
+        return f"static const {ctype} {name}[{len(a)}] = {{" + ",".join(str(x) for x in a) + "};\n"
+
+    out = ["/* GENERATED by engine/gen_topology.py from the installed catanatron. Do not edit. */",
+           "#pragma once", "#include <stdint.h>",
+           "#define N_NODES 54", "#define N_EDGES 72", "#define N_TILES 19", "#define N_PORTS 9",
+           f"#define N_ACTIONS {len(rows)}", ""]
+    out.append("/* action types (catan.c) */")
+    for at, code in AT.items():
+        out.append(f"#define AT_{at.name} {code}")
+    out.append("")
+    out.append(arr1("EDGE_A", [e[0] for e in edges]))
+    out.append(arr1("EDGE_B", [e[1] for e in edges]))
+    out.append("/* land neighbours in STATIC_GRAPH.neighbors order; -1 pads */")
+    out.append(arr2("NODE_NBR", nbr))
+    out.append(arr2("NODE_NBR_EDGE", nbr_edge))
+    out.append("/* tile ids = index in catan_map.land_tiles; nodes in NodeRef order N,NE,SE,S,SW,NW */")
+    out.append(arr2("TILE_NODES", tile_nodes))
+    out.append("/* adjacent land tiles per node, catan_map.adjacent_tiles order */")
+    out.append(arr2("NODE_TILES", node_tiles))
+    out.append("/* port id -> its two nodes */")
+    out.append(arr2("PORT_NODES", port_nodes))
+    out.append("/* official spiral order of land tile ids, start (2,-2,0) */")
+    out.append(arr1("SPIRAL", spiral))
+    out.append(arr1("SPIRAL_NUMBERS", BASE_NUMBERS_IN_SPIRAL_ORDER))
+    out.append("/* template multisets (tile resources: 0..4 = WOOD BRICK SHEEP WHEAT ORE, -1 desert;\n"
+               "   ports: -1 = 3:1) */")
+    rs = [(-1 if r is None else RESOURCES.index(r)) for r in BASE_MAP_TEMPLATE.tile_resources]
+    ps = [(-1 if r is None else RESOURCES.index(r)) for r in BASE_MAP_TEMPLATE.port_resources]
+    out.append(arr1("TEMPLATE_TILE_RES", rs))
+    out.append(arr1("TEMPLATE_PORT_RES", ps))
+    out.append("/* ACTIONS_ARRAY: {type, a, b, c}\n"
+               "   city/settlement: a=node; road: a=edge; discard/monopoly: a=resource;\n"
+               "   maritime: a=give, b=rate(4/3/2), c=get; robber: a=tile, b=0 none / 1 RED / 2 BLUE;\n"
+               "   year of plenty: a=first, b=second, c=number of cards */")
+    out.append(arr2("ACTION_TABLE", rows))
+    out.append("static const int16_t TILE_COORDS[19][3] = {" +
+               ",".join("{%d,%d,%d}" % c for c, _ in land) + "};\n")
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "topology.h")
+    with open(path, "w") as f:
+        f.write("\n".join(out))
+    print("wrote", path)
+
+
+if __name__ == "__main__":
+    main()
